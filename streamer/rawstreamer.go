@@ -12,15 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/xthexder/go-jack"
-)
-
-const (
-	EncodingSignedInt     = 1
-	EncodingUnsignedInt   = 1 << 1
-	EncodingFloatingPoint = 1 << 2
-
-	EncodingLittleEndian = 1 << 6
-	EncodingBigEndian    = 1 << 7
+	"github.com/xthexder/rawstreamer"
 )
 
 var Client *jack.Client
@@ -30,18 +22,20 @@ var Buffers []unsafe.Pointer
 func process(nframes uint32) int {
 	lsamples := Ports[0].GetBuffer(nframes)
 	rsamples := Ports[1].GetBuffer(nframes)
-	for i := 0; i < int(nframes); i++ {
-		for n, bufp := range Buffers {
-			tmp := (*[]chan jack.AudioSample)(atomic.LoadPointer(&bufp))
-			if tmp == nil {
-				continue
-			}
-			buf := *tmp
+	for n, bufp := range Buffers {
+		tmp := (*[]chan jack.AudioSample)(atomic.LoadPointer(&bufp))
+		if tmp == nil {
+			continue
+		}
+		buf := *tmp
+
+		for i := 0; i < int(nframes); i++ {
 			select {
 			case buf[0] <- lsamples[i]:
 				buf[1] <- rsamples[i]
 			default:
 				fmt.Println("Blocking on connection:", n)
+				break
 			}
 		}
 	}
@@ -69,7 +63,7 @@ func streamConnection(conn *net.TCPConn) {
 	defer atomic.StorePointer(&Buffers[bufi], nil)
 
 	bytes := make([]byte, 8)
-	conn.Write([]byte{'R', 1, byte(len(buf)), EncodingFloatingPoint | EncodingLittleEndian})
+	conn.Write([]byte{'R', 1, rawstreamer.EncodingFloatingPoint | rawstreamer.EncodingLittleEndian, 32})
 	binary.LittleEndian.PutUint32(bytes, Client.GetSampleRate())
 	conn.Write(bytes[0:4])
 	// TODO: Support different bitrates

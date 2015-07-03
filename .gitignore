@@ -22,5 +22,6 @@ _testmain.go
 *.exe
 *.test
 *.prof
-/rawstreamer
+/streamer/rawstreamer
+/player/rawplayer
 
