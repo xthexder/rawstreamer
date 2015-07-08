@@ -68,9 +68,22 @@ func main() {
 		return
 	}
 
+	encoding := flags & rawstreamer.EncodingMask
+
+	numBytes := int(buf[3])
+	bits := numBytes * 8
+	if numBytes < 1 || numBytes > 4 {
+		fmt.Printf("Unsupported number of bits: %d\n", bits)
+		return
+	}
+	if encoding == rawstreamer.EncodingFloatingPoint {
+		numBytes = 4
+		bits = 32
+	}
+
 	sampleRate := Endianness.Uint32(buf[4:])
 	fmt.Printf("Streaming info: %dHz, ", sampleRate)
-	fmt.Printf("32bit float, ")
+	fmt.Printf("%dbit %s, ", bits, rawstreamer.EncodingString[encoding])
 	fmt.Printf("%s\n", Endianness.String())
 
 	Buffers = []chan float32{
@@ -91,17 +104,72 @@ func main() {
 		close(Buffers[1])
 	}()
 
-	var bits uint32
+	buf = make([]byte, numBytes*2)
+	align := 8 % len(buf)
+	if align > 0 {
+		// Read in the extra padding
+		_, err = io.ReadFull(conn, buf[:len(buf)-align])
+		if err != nil {
+			fmt.Println("Error reading headers:", err)
+			return
+		}
+	}
+
+	tmp := make([]byte, 8)
 	for {
-		_, err = io.ReadFull(conn, buf)
+		_, err := io.ReadFull(conn, buf)
 		if err != nil {
 			fmt.Println("Error reading stream:", err)
 			return
 		}
 
-		bits = Endianness.Uint32(buf)
-		Buffers[0] <- math.Float32frombits(bits)
-		bits = Endianness.Uint32(buf[4:])
-		Buffers[1] <- math.Float32frombits(bits)
+		if encoding == rawstreamer.EncodingFloatingPoint {
+			lsample := Endianness.Uint32(buf)
+			rsample := Endianness.Uint32(buf[numBytes:])
+			Buffers[0] <- math.Float32frombits(lsample)
+			Buffers[1] <- math.Float32frombits(rsample)
+		} else {
+			offset := 0
+			if Endianness == binary.LittleEndian {
+				offset = numBytes - 1
+			}
+			var neg byte = 0
+			if encoding == rawstreamer.EncodingSignedInt && buf[offset]&(1<<7) != 0 {
+				neg = 0xFF
+			}
+			tmp[0] = neg
+			tmp[1] = neg
+			tmp[2] = neg
+			tmp[3] = neg
+
+			neg = 0
+			if encoding == rawstreamer.EncodingSignedInt && buf[numBytes+offset]&(1<<7) != 0 {
+				neg = 0xFF
+			}
+			tmp[4] = neg
+			tmp[5] = neg
+			tmp[6] = neg
+			tmp[7] = neg
+
+			if Endianness == binary.BigEndian {
+				copy(tmp[4-numBytes:4], buf)
+				copy(tmp[8-numBytes:8], buf[numBytes:])
+			} else {
+				copy(tmp[:numBytes], buf)
+				copy(tmp[4:4+numBytes], buf[numBytes:])
+			}
+
+			lsample := Endianness.Uint32(tmp)
+			rsample := Endianness.Uint32(tmp[4:])
+
+			div := float32(math.Pow(2, float64(bits-1)))
+			if encoding == rawstreamer.EncodingSignedInt {
+				Buffers[0] <- float32(int32(lsample)) / div
+				Buffers[1] <- float32(int32(rsample)) / div
+			} else {
+				Buffers[0] <- float32(lsample)/div - 1.0
+				Buffers[1] <- float32(rsample)/div - 1.0
+			}
+		}
 	}
 }
