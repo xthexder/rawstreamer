@@ -140,21 +140,58 @@ func streamConnection(conn *net.TCPConn) {
 
 	defer atomic.StorePointer(&Buffers[bufi], nil)
 
-	bytes := make([]byte, 8)
-	conn.Write([]byte{'R', 1, rawstreamer.EncodingFloatingPoint | rawstreamer.EncodingLittleEndian, 4})
-	binary.LittleEndian.PutUint32(bytes, Client.GetSampleRate())
-	conn.Write(bytes[0:4])
-	// TODO: Support different bitrates
-	for {
-		lsample := <-buf[0]
-		rsample := <-buf[1]
-		bits := math.Float32bits(float32(lsample))
-		binary.LittleEndian.PutUint32(bytes, bits)
-		bits = math.Float32bits(float32(rsample))
-		binary.LittleEndian.PutUint32(bytes[4:], bits)
-		_, err := conn.Write(bytes)
-		if err != nil {
-			return
+	numBytes := bits / 8
+	conn.Write([]byte{'R', 1, formatFlag, byte(numBytes)})
+	bytes := make([]byte, 4)
+	endianness.PutUint32(bytes, Client.GetSampleRate())
+	conn.Write(bytes[:4])
+	bytes = make([]byte, bits/4)
+	align := 8 % len(bytes)
+	if align > 0 {
+		// Add extra padding to make the header an even number of samples in length
+		conn.Write(bytes[:len(bytes)-align])
+	}
+
+	if formatFlag&rawstreamer.EncodingMask == rawstreamer.EncodingFloatingPoint {
+		for {
+			lsample := <-buf[0]
+			rsample := <-buf[1]
+
+			bits := math.Float32bits(float32(lsample))
+			endianness.PutUint32(bytes, bits)
+			bits = math.Float32bits(float32(rsample))
+			endianness.PutUint32(bytes[numBytes:], bits)
+			_, err := conn.Write(bytes)
+			if err != nil {
+				return
+			}
+		}
+	} else {
+		mult := float32(math.Pow(2, float64(bits-1)))
+		var offset float32 = -0.5 // Round float instead of floor
+		if formatFlag&rawstreamer.EncodingMask == rawstreamer.EncodingUnsignedInt {
+			offset = mult - 1.5
+		}
+
+		tmp := make([]byte, 8)
+		for {
+			lsample := uint32(float32(<-buf[0])*mult + offset)
+			rsample := uint32(float32(<-buf[1])*mult + offset)
+
+			endianness.PutUint32(tmp, lsample)
+			endianness.PutUint32(tmp[4:], rsample)
+
+			if endianness == binary.BigEndian {
+				copy(bytes, tmp[4-numBytes:4])
+				copy(bytes[numBytes:], tmp[8-numBytes:8])
+			} else {
+				copy(bytes, tmp[:numBytes])
+				copy(bytes[numBytes:], tmp[4:4+numBytes])
+			}
+			_, err := conn.Write(bytes)
+			if err != nil {
+				return
+			}
 		}
 	}
 }
@@ -176,6 +213,33 @@ func getBuffer() (int, []chan jack.AudioSample) {
 }
 
 func main() {
+	if bits < 8 || bits > 32 || bits%8 != 0 {
+		fmt.Println("Audio bits must be one of: 8, 16, 24, 32")
+		return
+	}
+	formatFlag = 0
+	for flag, str := range rawstreamer.EncodingString {
+		if format == str {
+			formatFlag = flag
+			break
+		}
+	}
+	if formatFlag == 0 {
+		fmt.Printf("Unsupported stream format: %s\n", format)
+		return
+	}
+	if formatFlag == rawstreamer.EncodingFloatingPoint {
+		bits = 32
+	}
+
+	if bigEndian {
+		endianness = binary.BigEndian
+		formatFlag |= rawstreamer.EncodingBigEndian
+	} else {
+		endianness = binary.LittleEndian
+		formatFlag |= rawstreamer.EncodingLittleEndian
+	}
+
 	var status int
 	Client, status = jack.ClientOpen("Raw Streamer", jack.NoStartServer)
 	if status != 0 {
@@ -233,14 +297,29 @@ func main() {
 	}
 }
 
+var formatFlag byte
+var endianness binary.ByteOrder
+
 var addr string
 var maxConns int
+
+var bits int
+var format string
+var bigEndian bool
+var littleEndian bool
+
 var mirror string
 var procName string
 
 func init() {
 	flag.StringVar(&addr, "addr", ":5253", "Listen address")
 	flag.IntVar(&maxConns, "max-conn", 128, "Maximum number of connected clients")
+
+	flag.IntVar(&bits, "bits", 24, "Stream audio bit")
+	flag.StringVar(&format, "format", "int", "Stream format (int, uint, float)")
+	flag.BoolVar(&bigEndian, "big-endian", false, "Big-endian stream encoding")
+	flag.BoolVar(&littleEndian, "little-endian", true, "Little-endian stream encoding (default)")
+
 	flag.StringVar(&mirror, "mirror", "", "The name of a port to mirror (prefix matched)")
 	flag.StringVar(&procName, "proc-name", "", "An alsa process to auto-connect to (substring matched)")
 	flag.Parse()
