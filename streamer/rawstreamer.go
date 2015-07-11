@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/xthexder/go-jack"
@@ -21,6 +21,9 @@ import (
 var Client *jack.Client
 var Ports []*jack.Port
 var Buffers []unsafe.Pointer
+var Listener net.Listener
+var ClientWaitGroup sync.WaitGroup
+var ShuttingDown chan struct{}
 
 func process(nframes uint32) int {
 	lsamples := Ports[0].GetBuffer(nframes)
@@ -89,10 +92,51 @@ func updateProcs() {
 	}
 }
 
+func updateSources() {
+	ports := Client.GetPorts("^"+source, Ports[0].GetType(), jack.PortIsOutput)
+	sources := make(map[string][]string)
+	for _, name := range ports {
+		clientName := strings.SplitN(name, ":", 2)[0]
+		sources[clientName] = append(sources[clientName], name)
+	}
+	for _, names := range sources {
+		if len(names) == 1 { // Mono source
+			for _, port := range Ports {
+				Client.Connect(names[0], port.GetName())
+			}
+		} else {
+			for i, name := range names {
+				if i < len(Ports) {
+					Client.Connect(name, Ports[i].GetName())
+				}
+			}
+		}
+	}
+}
+
 func portRegistered(portId jack.PortId, registered bool) {
 	if registered && !Client.IsPortMine(Client.GetPortById(portId)) {
 		go updateProcs()
+		go updateSources()
 	}
+}
+
+func disconnectClients() {
+	for _, bufp := range Buffers {
+		tmp := (*[]chan jack.AudioSample)(atomic.LoadPointer(&bufp))
+		if tmp == nil {
+			continue
+		}
+		buf := *tmp
+		close(buf[0])
+		close(buf[1])
+	}
+}
+
+func sampleRateChanged(sampleRate uint32) int {
+	printStreamInfo()
+	disconnectClients()
+	return 0
 }
 
 func portConnect(portAId, portBId jack.PortId, connected bool) {
@@ -122,11 +166,14 @@ func portConnect(portAId, portBId jack.PortId, connected bool) {
 
 func shutdown() {
 	fmt.Println("Shutting down")
-	os.Exit(1)
+	close(ShuttingDown)
+	Listener.Close()
+	disconnectClients()
 }
 
 func streamConnection(conn *net.TCPConn) {
 	defer conn.Close()
+	defer ClientWaitGroup.Done()
 	bufi, buf := getBuffer()
 	if buf == nil {
 		conn.Write([]byte{'R', 0})
@@ -212,9 +259,17 @@ func getBuffer() (int, []chan jack.AudioSample) {
 	return -1, nil
 }
 
+func printStreamInfo() {
+	fmt.Printf("Stream info: %dHz, ", Client.GetSampleRate())
+	fmt.Printf("%dbit %s, ", bits, rawstreamer.EncodingString[formatFlag&rawstreamer.EncodingMask])
+	fmt.Printf("%s, %v max buffer\n", endianness.String(), bufferLen)
+}
+
 func main() {
+	ShuttingDown = make(chan struct{})
+
 	if bits < 8 || bits > 32 || bits%8 != 0 {
-		fmt.Println("Audio bits must be one of: 8, 16, 24, 32")
+		fmt.Println("Bit-depth must be one of: 8, 16, 24, 32")
 		return
 	}
 	formatFlag = 0
@@ -240,6 +295,13 @@ func main() {
 		formatFlag |= rawstreamer.EncodingLittleEndian
 	}
 
+	var err error
+	bufferLen, err = time.ParseDuration(bufferStr)
+	if err != nil {
+		fmt.Printf("Invalid buffer length: %v\n", err)
+		return
+	}
+
 	var status int
 	Client, status = jack.ClientOpen("Raw Streamer", jack.NoStartServer)
 	if status != 0 {
@@ -250,6 +312,10 @@ func main() {
 
 	if code := Client.SetProcessCallback(process); code != 0 {
 		fmt.Printf("Failed to set process callback: %d\n", code)
+		return
+	}
+	if code := Client.SetSampleRateCallback(sampleRateChanged); code != 0 {
+		fmt.Printf("Failed to set sample rate callback: %d\n", code)
 		return
 	}
 	if code := Client.SetPortRegistrationCallback(portRegistered); code != 0 {
@@ -279,26 +345,37 @@ func main() {
 	if len(procName) > 0 {
 		updateProcs()
 	}
+	if len(source) > 0 {
+		updateSources()
+	}
 
-	ln, err := net.Listen("tcp", addr)
+	Listener, err = net.Listen("tcp", addr)
 	if err != nil {
 		fmt.Printf("Error listening on address '%s': %v\n", addr, err)
 		return
 	} else {
-		fmt.Printf("Listening on address: %s\n", ln.Addr().String())
+		fmt.Printf("Listening on address: %s\n", Listener.Addr().String())
 	}
 	for {
-		conn, err := ln.Accept()
+		conn, err := Listener.Accept()
 		if err != nil {
-			fmt.Printf("Error accepting connection: %v\n", err)
-			continue
+			select {
+			case <-ShuttingDown:
+				ClientWaitGroup.Wait()
+				return
+			default:
+				fmt.Printf("Error accepting connection: %v\n", err)
+				continue
+			}
 		}
+		ClientWaitGroup.Add(1)
 		go streamConnection(conn.(*net.TCPConn))
 	}
 }
 
 var formatFlag byte
 var endianness binary.ByteOrder
+var bufferLen time.Duration
 
 var addr string
 var maxConns int
@@ -308,19 +385,25 @@ var format string
 var bigEndian bool
 var littleEndian bool
 
+var bufferStr string
+
 var mirror string
 var procName string
+var source string
 
 func init() {
 	flag.StringVar(&addr, "addr", ":5253", "Listen address")
 	flag.IntVar(&maxConns, "max-conn", 128, "Maximum number of connected clients")
 
-	flag.IntVar(&bits, "bits", 24, "Stream audio bit")
+	flag.IntVar(&bits, "bits", 24, "Stream bit-depth")
 	flag.StringVar(&format, "format", "int", "Stream format (int, uint, float)")
 	flag.BoolVar(&bigEndian, "big-endian", false, "Big-endian stream encoding")
 	flag.BoolVar(&littleEndian, "little-endian", true, "Little-endian stream encoding (default)")
 
+	flag.StringVar(&bufferStr, "buffer", "100ms", "Max buffer length")
+
 	flag.StringVar(&mirror, "mirror", "", "The name of a port to mirror (prefix matched)")
-	flag.StringVar(&procName, "proc-name", "", "An alsa process to auto-connect to (substring matched)")
+	flag.StringVar(&procName, "proc-name", "", "An alsa process to auto-connect (substring matched)")
+	flag.StringVar(&source, "source", "", "The name of a port to auto-connect (prefix matched)")
 	flag.Parse()
 }
