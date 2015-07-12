@@ -46,7 +46,7 @@ func process(nframes uint32) int {
 			case *buf <- buffer:
 			default:
 				fmt.Println("Channel full for client:", client)
-				break
+				n = len(lsamples)
 			}
 		}
 	}
@@ -234,7 +234,7 @@ func streamConnection(conn *net.TCPConn) {
 		}
 
 		conn.SetWriteDeadline(time.Now().Add(bufferLen))
-		_, err = conn.Write(bytes)
+		_, err := conn.Write(bytes)
 		if err != nil {
 			if err2, ok := err.(*net.OpError); ok && err2.Timeout() {
 				fmt.Println("Write timeout!")
