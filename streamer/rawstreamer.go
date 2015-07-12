@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"math"
 	"net"
 	"os/exec"
 	"strconv"
@@ -217,20 +216,7 @@ func streamConnection(conn *net.TCPConn) {
 		conn.Write(sample[:len(sample)-align])
 	}
 
-	err := conn.SetNoDelay(true)
-	if err != nil {
-		fmt.Println("Error setting tcp no delay:", err)
-		return
-	}
-
-	mult := float32(math.Pow(2, float64(bits-1)))
-	var offset float32 = -0.5 // Round float instead of floor
-	if formatFlag&rawstreamer.EncodingMask == rawstreamer.EncodingUnsignedInt {
-		offset = mult - 1.5
-	}
-
 	bytes = make([]byte, 0, int(Client.GetBufferSize())*2)
-	tmp := make([]byte, 8)
 	for {
 		buffer := <-buf
 		if buffer == nil {
@@ -241,26 +227,8 @@ func streamConnection(conn *net.TCPConn) {
 		rsamples := buffer[len(buffer)/2:]
 
 		for i := range lsamples {
-			if formatFlag&rawstreamer.EncodingMask == rawstreamer.EncodingFloatingPoint {
-				bits := math.Float32bits(float32(lsamples[i]))
-				endianness.PutUint32(sample, bits)
-				bits = math.Float32bits(float32(rsamples[i]))
-				endianness.PutUint32(sample[numBytes:], bits)
-			} else {
-				lsample := uint32(float32(lsamples[i])*mult + offset)
-				rsample := uint32(float32(rsamples[i])*mult + offset)
-
-				endianness.PutUint32(tmp, lsample)
-				endianness.PutUint32(tmp[4:], rsample)
-
-				if endianness == binary.BigEndian {
-					copy(sample, tmp[4-numBytes:4])
-					copy(sample[numBytes:], tmp[8-numBytes:8])
-				} else {
-					copy(sample, tmp[:numBytes])
-					copy(sample[numBytes:], tmp[4:4+numBytes])
-				}
-			}
+			rawstreamer.WriteFloat32(sample[:numBytes], float32(lsamples[i]), formatFlag, endianness)
+			rawstreamer.WriteFloat32(sample[numBytes:], float32(rsamples[i]), formatFlag, endianness)
 
 			bytes = append(bytes, sample...)
 		}
