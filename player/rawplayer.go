@@ -21,8 +21,18 @@ func processAudio(out [][]float32) {
 	select {
 	case <-Started:
 		for i := range out[0] {
-			out[0][i] = <-Buffers[0]
-			out[1][i] = <-Buffers[1]
+			select {
+			case out[0][i] = <-Buffers[0]:
+				out[1][i] = <-Buffers[1]
+			default:
+				fmt.Printf("Dropped %d frames\n", len(out[0])-i)
+				for ; i < len(out[0]); i++ {
+					out[0][i] = 0
+					out[1][i] = 0
+				}
+				return
+			}
+
 		}
 	default:
 		for i := range out[0] {
@@ -146,11 +156,13 @@ func main() {
 	remainder := 0
 	bufferFill := getChannelBufferSize(bufferLen, bufferSize, sampleRate)
 	for {
-		n, err := io.ReadAtLeast(conn, buf[remainder:], numBytes*2-remainder)
+		n := 0
+		n, err = io.ReadAtLeast(conn, buf[remainder:], numBytes*2-remainder)
 		if err != nil {
 			fmt.Println("Error reading stream:", err)
 			return
 		}
+		n += remainder
 		remainder = n % (numBytes * 2)
 
 		for i := 0; i < (n - remainder); i += numBytes * 2 {
