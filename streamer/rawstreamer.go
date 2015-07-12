@@ -21,6 +21,7 @@ import (
 var Client *jack.Client
 var Ports []*jack.Port
 var Buffers []unsafe.Pointer
+var BufferPool chan []jack.AudioSample
 var Listener net.Listener
 var ClientWaitGroup sync.WaitGroup
 var ShuttingDown chan struct{}
@@ -28,28 +29,36 @@ var ShuttingDown chan struct{}
 func process(nframes uint32) int {
 	lsamples := Ports[0].GetBuffer(nframes)
 	rsamples := Ports[1].GetBuffer(nframes)
-	for _, bufp := range Buffers {
-		tmp := (*[]chan jack.AudioSample)(atomic.LoadPointer(&bufp))
-		if tmp == nil {
+	for client, bufp := range Buffers {
+		buf := (*chan []jack.AudioSample)(atomic.LoadPointer(&bufp))
+		if buf == nil {
 			continue
 		}
-		buf := *tmp
 
-		for i := 0; i < int(nframes); i++ {
+		n := 0
+		for n < len(lsamples) {
+			buffer := <-BufferPool
+			nl := copy(buffer[:len(buffer)/2], lsamples[n:])
+			buffer = buffer[:nl*2]
+			copy(buffer[nl:], rsamples[n:])
+			n += nl
+
 			select {
-			case buf[0] <- lsamples[i]:
-				buf[1] <- rsamples[i]
+			case *buf <- buffer:
 			default:
-				// fmt.Println("Blocking on connection:", n)
+				fmt.Println("Channel full for client:", client)
 				break
 			}
 		}
-		// fmt.Println("Chan size:", len(buf[0]))
 	}
 	return 0
 }
 
 func initPortMirror() {
+	if len(mirror) <= 0 {
+		return
+	}
+
 	ports := Client.GetPorts("^"+mirror, Ports[0].GetType(), jack.PortIsInput)
 	for i, name := range ports {
 		if i < len(Ports) {
@@ -63,6 +72,10 @@ func initPortMirror() {
 }
 
 func updateProcs() {
+	if len(procName) <= 0 {
+		return
+	}
+
 	ports := Client.GetPorts("^alsa-jack\\.jackP\\.", Ports[0].GetType(), jack.PortIsOutput)
 	procs := make(map[string]int)
 	for _, name := range ports {
@@ -93,6 +106,10 @@ func updateProcs() {
 }
 
 func updateSources() {
+	if len(source) <= 0 {
+		return
+	}
+
 	ports := Client.GetPorts("^"+source, Ports[0].GetType(), jack.PortIsOutput)
 	sources := make(map[string][]string)
 	for _, name := range ports {
@@ -123,19 +140,22 @@ func portRegistered(portId jack.PortId, registered bool) {
 
 func disconnectClients() {
 	for _, bufp := range Buffers {
-		tmp := (*[]chan jack.AudioSample)(atomic.LoadPointer(&bufp))
-		if tmp == nil {
+		buf := (*chan []jack.AudioSample)(atomic.LoadPointer(&bufp))
+		if buf == nil {
 			continue
 		}
-		buf := *tmp
-		close(buf[0])
-		close(buf[1])
+		close(*buf)
 	}
 }
 
 func sampleRateChanged(sampleRate uint32) int {
 	printStreamInfo()
 	disconnectClients()
+	return 0
+}
+
+func bufferSizeChanged(bufferSize uint32) int {
+	atomic.StoreUint32(&jackBufferSize, bufferSize*2)
 	return 0
 }
 
@@ -181,82 +201,128 @@ func streamConnection(conn *net.TCPConn) {
 		return
 	}
 
-	for i := 0; i < len(buf); i++ {
-		buf[i] = make(chan jack.AudioSample, 4096) // TODO: calculate this number
-	}
-
 	defer atomic.StorePointer(&Buffers[bufi], nil)
 
 	numBytes := bits / 8
 	conn.Write([]byte{'R', 1, formatFlag, byte(numBytes)})
 	bytes := make([]byte, 4)
-	endianness.PutUint32(bytes, Client.GetSampleRate())
+	sampleRate := Client.GetSampleRate()
+	endianness.PutUint32(bytes, sampleRate)
 	conn.Write(bytes[:4])
-	bytes = make([]byte, bits/4)
-	align := 8 % len(bytes)
+
+	sample := make([]byte, bits/4)
+	align := 8 % len(sample)
 	if align > 0 {
 		// Add extra padding to make the header an even number of samples in length
-		conn.Write(bytes[:len(bytes)-align])
+		conn.Write(sample[:len(sample)-align])
 	}
 
-	if formatFlag&rawstreamer.EncodingMask == rawstreamer.EncodingFloatingPoint {
-		for {
-			lsample := <-buf[0]
-			rsample := <-buf[1]
+	err := conn.SetNoDelay(true)
+	if err != nil {
+		fmt.Println("Error setting tcp no delay:", err)
+		return
+	}
 
-			bits := math.Float32bits(float32(lsample))
-			endianness.PutUint32(bytes, bits)
-			bits = math.Float32bits(float32(rsample))
-			endianness.PutUint32(bytes[numBytes:], bits)
-			_, err := conn.Write(bytes)
-			if err != nil {
-				return
-			}
+	mult := float32(math.Pow(2, float64(bits-1)))
+	var offset float32 = -0.5 // Round float instead of floor
+	if formatFlag&rawstreamer.EncodingMask == rawstreamer.EncodingUnsignedInt {
+		offset = mult - 1.5
+	}
+
+	bytes = make([]byte, 0, int(Client.GetBufferSize())*2)
+	tmp := make([]byte, 8)
+	for {
+		buffer := <-buf
+		if buffer == nil {
+			return
 		}
-	} else {
-		mult := float32(math.Pow(2, float64(bits-1)))
-		var offset float32 = -0.5 // Round float instead of floor
-		if formatFlag&rawstreamer.EncodingMask == rawstreamer.EncodingUnsignedInt {
-			offset = mult - 1.5
-		}
 
-		tmp := make([]byte, 8)
-		for {
-			lsample := uint32(float32(<-buf[0])*mult + offset)
-			rsample := uint32(float32(<-buf[1])*mult + offset)
+		lsamples := buffer[:len(buffer)/2]
+		rsamples := buffer[len(buffer)/2:]
 
-			endianness.PutUint32(tmp, lsample)
-			endianness.PutUint32(tmp[4:], rsample)
-
-			if endianness == binary.BigEndian {
-				copy(bytes, tmp[4-numBytes:4])
-				copy(bytes[numBytes:], tmp[8-numBytes:8])
+		for i := range lsamples {
+			if formatFlag&rawstreamer.EncodingMask == rawstreamer.EncodingFloatingPoint {
+				bits := math.Float32bits(float32(lsamples[i]))
+				endianness.PutUint32(sample, bits)
+				bits = math.Float32bits(float32(rsamples[i]))
+				endianness.PutUint32(sample[numBytes:], bits)
 			} else {
-				copy(bytes, tmp[:numBytes])
-				copy(bytes[numBytes:], tmp[4:4+numBytes])
+				lsample := uint32(float32(lsamples[i])*mult + offset)
+				rsample := uint32(float32(rsamples[i])*mult + offset)
+
+				endianness.PutUint32(tmp, lsample)
+				endianness.PutUint32(tmp[4:], rsample)
+
+				if endianness == binary.BigEndian {
+					copy(sample, tmp[4-numBytes:4])
+					copy(sample[numBytes:], tmp[8-numBytes:8])
+				} else {
+					copy(sample, tmp[:numBytes])
+					copy(sample[numBytes:], tmp[4:4+numBytes])
+				}
 			}
-			_, err := conn.Write(bytes)
-			if err != nil {
+
+			bytes = append(bytes, sample...)
+		}
+
+		conn.SetWriteDeadline(time.Now().Add(bufferLen))
+		_, err = conn.Write(bytes)
+		if err != nil {
+			if err2, ok := err.(*net.OpError); ok && err2.Timeout() {
+				fmt.Println("Write timeout!")
+			} else {
+				returnToPool(buffer)
 				return
 			}
 		}
+
+		bytes = bytes[:0]
+		returnToPool(buffer)
 	}
 }
 
 var bufSync sync.Mutex
 
-func getBuffer() (int, []chan jack.AudioSample) {
+func getBufferChanSize() int {
+	bufferSize := time.Duration(atomic.LoadUint32(&jackBufferSize) / 2)
+	sampleRate := time.Duration(Client.GetSampleRate())
+	return int(bufferLen*sampleRate/bufferSize/time.Second) + 1
+}
+
+func getBuffer() (int, chan []jack.AudioSample) {
 	bufSync.Lock()
 	defer bufSync.Unlock()
 
-	for i, buf := range Buffers {
-		if buf == nil {
-			buf2 := make([]chan jack.AudioSample, len(Ports))
-			atomic.StorePointer(&Buffers[i], unsafe.Pointer(&buf2))
-			return i, buf2
+	for i, bufp := range Buffers {
+		buf := (*chan []jack.AudioSample)(atomic.LoadPointer(&bufp))
+		if buf != nil {
+			continue
 		}
+		buf2 := make(chan []jack.AudioSample, getBufferChanSize())
+		atomic.StorePointer(&Buffers[i], unsafe.Pointer(&buf2))
+		return i, buf2
 	}
 	return -1, nil
+}
+
+var jackBufferSize uint32
+
+func initPool() {
+	atomic.StoreUint32(&jackBufferSize, Client.GetBufferSize()*2)
+	bufferSize := int(atomic.LoadUint32(&jackBufferSize))
+	BufferPool = make(chan []jack.AudioSample, getBufferChanSize()*maxConns)
+	for i := 0; i < cap(BufferPool); i++ {
+		BufferPool <- make([]jack.AudioSample, bufferSize)
+	}
+}
+
+func returnToPool(buffer []jack.AudioSample) {
+	bufferSize := int(atomic.LoadUint32(&jackBufferSize))
+	if cap(buffer) < bufferSize {
+		BufferPool <- make([]jack.AudioSample, bufferSize)
+	} else {
+		BufferPool <- buffer[:bufferSize]
+	}
 }
 
 func printStreamInfo() {
@@ -318,6 +384,10 @@ func main() {
 		fmt.Printf("Failed to set sample rate callback: %d\n", code)
 		return
 	}
+	if code := Client.SetBufferSizeCallback(bufferSizeChanged); code != 0 {
+		fmt.Printf("Failed to set buffer size callback: %d\n", code)
+		return
+	}
 	if code := Client.SetPortRegistrationCallback(portRegistered); code != 0 {
 		fmt.Printf("Failed to set port registration callback: %d\n", code)
 		return
@@ -338,16 +408,11 @@ func main() {
 		Ports = append(Ports, port)
 	}
 	Buffers = make([]unsafe.Pointer, maxConns)
+	initPool()
 
-	if len(mirror) > 0 {
-		initPortMirror()
-	}
-	if len(procName) > 0 {
-		updateProcs()
-	}
-	if len(source) > 0 {
-		updateSources()
-	}
+	initPortMirror()
+	updateProcs()
+	updateSources()
 
 	Listener, err = net.Listen("tcp", addr)
 	if err != nil {
