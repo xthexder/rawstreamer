@@ -6,26 +6,27 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
-	"github.com/xthexder/rawstreamer"
 
 	"code.google.com/p/portaudio-go/portaudio"
+	"github.com/xthexder/rawstreamer"
 )
 
 var Endianness binary.ByteOrder
 var Stream *portaudio.Stream
 var Buffers []chan float32
-var Started chan struct{}
+var Buffering int32
 
 func processAudio(out [][]float32) {
-	select {
-	case <-Started:
+	if atomic.LoadInt32(&Buffering) <= 0 {
 		for i := range out[0] {
 			select {
 			case out[0][i] = <-Buffers[0]:
 				out[1][i] = <-Buffers[1]
 			default:
 				fmt.Printf("Dropped %d frames\n", len(out[0])-i)
+				atomic.StoreInt32(&Buffering, int32(len(out[0])-i))
 				for ; i < len(out[0]); i++ {
 					out[0][i] = 0
 					out[1][i] = 0
@@ -34,7 +35,7 @@ func processAudio(out [][]float32) {
 			}
 
 		}
-	default:
+	} else {
 		for i := range out[0] {
 			out[0][i] = 0
 			out[1][i] = 0
@@ -66,8 +67,6 @@ func main() {
 		fmt.Printf("Invalid buffer length: %v\n", err)
 		return
 	}
-
-	Started = make(chan struct{})
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -129,6 +128,8 @@ func main() {
 		make(chan float32, getChannelBufferSize(bufferLen, bufferSize, sampleRate)),
 	}
 
+	Buffering = int32(getChannelBufferSize(bufferLen, bufferSize, sampleRate))
+
 	Stream, err = portaudio.OpenDefaultStream(0, 2, float64(sampleRate), int(bufferSize), processAudio)
 	defer Stream.Close()
 	err = Stream.Start()
@@ -154,7 +155,6 @@ func main() {
 	}
 
 	remainder := 0
-	bufferFill := getChannelBufferSize(bufferLen, bufferSize, sampleRate)
 	for {
 		n := 0
 		n, err = io.ReadAtLeast(conn, buf[remainder:], numBytes*2-remainder)
@@ -166,12 +166,10 @@ func main() {
 		remainder = n % (numBytes * 2)
 
 		for i := 0; i < (n - remainder); i += numBytes * 2 {
-			if bufferFill > 0 {
-				bufferFill--
-				if bufferFill == 0 {
-					close(Started)
-				}
+			if atomic.LoadInt32(&Buffering) > 0 {
+				atomic.AddInt32(&Buffering, -1)
 			}
+			
 			Buffers[0] <- rawstreamer.ReadFloat32(buf[i:i+numBytes], flags, Endianness)
 			Buffers[1] <- rawstreamer.ReadFloat32(buf[i+numBytes:i+numBytes*2], flags, Endianness)
 		}
