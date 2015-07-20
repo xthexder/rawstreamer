@@ -6,10 +6,12 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"code.google.com/p/portaudio-go/portaudio"
+	"github.com/cheggaaa/pb"
 	"github.com/xthexder/rawstreamer"
 )
 
@@ -17,23 +19,28 @@ var Endianness binary.ByteOrder
 var Stream *portaudio.Stream
 var Buffers []chan float32
 var Buffering int32
+var BufferingSync sync.Mutex
 
 func processAudio(out [][]float32) {
+	bar.Set(len(Buffers[0]))
 	if atomic.LoadInt32(&Buffering) <= 0 {
 		for i := range out[0] {
 			select {
 			case out[0][i] = <-Buffers[0]:
 				out[1][i] = <-Buffers[1]
 			default:
-				fmt.Printf("Dropped %d frames\n", len(out[0])-i)
-				atomic.StoreInt32(&Buffering, int32(len(out[0])-i))
+				fmt.Println("Buffer underflow!")
+				go func() {
+					BufferingSync.Lock()
+					defer BufferingSync.Unlock()
+					atomic.StoreInt32(&Buffering, int32(cap(Buffers[0])-len(Buffers[0])))
+				}()
 				for ; i < len(out[0]); i++ {
 					out[0][i] = 0
 					out[1][i] = 0
 				}
 				return
 			}
-
 		}
 	} else {
 		for i := range out[0] {
@@ -45,6 +52,19 @@ func processAudio(out [][]float32) {
 
 func getChannelBufferSize(bufferLen time.Duration, bufferSize, sampleRate uint32) int {
 	return int(bufferLen*time.Duration(sampleRate)/time.Second) + 1
+}
+
+var bar *pb.ProgressBar
+
+func printStatus() {
+	count := cap(Buffers[0])
+	bar = pb.New(count)
+
+	bar.SetRefreshRate(100 * time.Millisecond)
+	bar.ShowCounters = true
+	bar.ShowTimeLeft = false
+
+	bar.Start()
 }
 
 func main() {
@@ -130,6 +150,8 @@ func main() {
 
 	Buffering = int32(getChannelBufferSize(bufferLen, bufferSize, sampleRate))
 
+	printStatus()
+
 	Stream, err = portaudio.OpenDefaultStream(0, 2, float64(sampleRate), int(bufferSize), processAudio)
 	defer Stream.Close()
 	err = Stream.Start()
@@ -166,12 +188,14 @@ func main() {
 		remainder = n % (numBytes * 2)
 
 		for i := 0; i < (n - remainder); i += numBytes * 2 {
+			BufferingSync.Lock()
 			if atomic.LoadInt32(&Buffering) > 0 {
 				atomic.AddInt32(&Buffering, -1)
 			}
-			
+
 			Buffers[0] <- rawstreamer.ReadFloat32(buf[i:i+numBytes], flags, Endianness)
 			Buffers[1] <- rawstreamer.ReadFloat32(buf[i+numBytes:i+numBytes*2], flags, Endianness)
+			BufferingSync.Unlock()
 		}
 
 		copy(buf, buf[n-remainder:n])
