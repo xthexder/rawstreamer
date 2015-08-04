@@ -234,18 +234,36 @@ func streamConnection(conn *net.TCPConn) {
 		}
 
 		conn.SetWriteDeadline(time.Now().Add(bufferLen))
-		_, err := conn.Write(bytes)
-		if err != nil {
-			if err2, ok := err.(*net.OpError); ok && err2.Timeout() {
-				fmt.Println("Write timeout!")
-			} else {
-				returnToPool(buffer)
-				return
+		count := 0
+		for count < len(bytes) {
+			n, err := conn.Write(bytes[count:])
+			if err != nil {
+				if err2, ok := err.(*net.OpError); ok && err2.Timeout() {
+					fmt.Println("Write timeout!")
+
+					// Add extra padding to make sure we're still aligned
+					align := count % len(sample)
+					conn.SetWriteDeadline(time.Time{})
+					for align > 0 {
+						n, err := conn.Write(sample[:len(sample)-align])
+						if err != nil {
+							fmt.Println("Realign write error: %v\n", err)
+							return
+						}
+						align -= n
+					}
+					break
+				} else {
+					fmt.Printf("Sample write error: %v\n", err)
+					returnToPool(buffer)
+					return
+				}
 			}
+			count += n
 		}
+		returnToPool(buffer)
 
 		bytes = bytes[:0]
-		returnToPool(buffer)
 	}
 }
 
