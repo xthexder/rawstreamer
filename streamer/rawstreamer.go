@@ -190,6 +190,29 @@ func shutdown() {
 	disconnectClients()
 }
 
+var ErrWriteTimeout = fmt.Errorf("write timeout")
+
+func writeAligned(conn *net.TCPConn, buf []byte, timeout time.Time) error {
+	conn.SetWriteDeadline(timeout)
+	n, err := conn.Write(buf)
+	if err != nil {
+		if err2, ok := err.(*net.OpError); ok && err2.Timeout() {
+			// Add extra padding to make sure we're still aligned
+			align := n % (bits / 4)
+			if align > 0 {
+				fmt.Printf("Realigning: %d + %d\n", n, (bits/4)-align)
+				conn.SetWriteDeadline(time.Time{})
+				_, err = conn.Write(make([]byte, (bits/4)-align))
+				if err != nil {
+					return err
+				}
+			}
+			return ErrWriteTimeout
+		}
+	}
+	return err
+}
+
 func streamConnection(conn *net.TCPConn) {
 	defer conn.Close()
 	defer ClientWaitGroup.Done()
@@ -203,17 +226,26 @@ func streamConnection(conn *net.TCPConn) {
 	defer atomic.StorePointer(&Buffers[bufi], nil)
 
 	numBytes := bits / 8
-	conn.Write([]byte{'R', 1, formatFlag, byte(numBytes)})
+	_, err := conn.Write([]byte{'R', 1, formatFlag, byte(numBytes)})
+	if err != nil {
+		return
+	}
 	bytes := make([]byte, 4)
 	sampleRate := Client.GetSampleRate()
 	endianness.PutUint32(bytes, sampleRate)
-	conn.Write(bytes[:4])
+	_, err = conn.Write(bytes[:4])
+	if err != nil {
+		return
+	}
 
 	sample := make([]byte, bits/4)
 	align := 8 % len(sample)
 	if align > 0 {
 		// Add extra padding to make the header an even number of samples in length
-		conn.Write(sample[:len(sample)-align])
+		_, err = conn.Write(sample[:len(sample)-align])
+		if err != nil {
+			return
+		}
 	}
 
 	bytes = make([]byte, 0, int(Client.GetBufferSize())*2)
@@ -233,34 +265,15 @@ func streamConnection(conn *net.TCPConn) {
 			bytes = append(bytes, sample...)
 		}
 
-		conn.SetWriteDeadline(time.Now().Add(bufferLen))
-		count := 0
-		for count < len(bytes) {
-			n, err := conn.Write(bytes[count:])
-			if err != nil {
-				if err2, ok := err.(*net.OpError); ok && err2.Timeout() {
-					fmt.Println("Write timeout!")
-
-					// Add extra padding to make sure we're still aligned
-					align := count % len(sample)
-					conn.SetWriteDeadline(time.Time{})
-					for align > 0 {
-						n, err := conn.Write(sample[:len(sample)-align])
-						if err != nil {
-							fmt.Println("Realign write error: %v\n", err)
-							return
-						}
-						align -= n
-					}
-					break
-				} else {
-					fmt.Printf("Sample write error: %v\n", err)
-					returnToPool(buffer)
-					return
-				}
-			}
-			count += n
+		err = writeAligned(conn, bytes, time.Now().Add(bufferLen))
+		if err == ErrWriteTimeout {
+			fmt.Println("Write timeout!")
+		} else if err != nil {
+			fmt.Printf("Sample write error: %v\n", err)
+			returnToPool(buffer)
+			return
 		}
+
 		returnToPool(buffer)
 
 		bytes = bytes[:0]
