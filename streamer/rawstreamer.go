@@ -70,10 +70,14 @@ func initPortMirror() {
 	}
 }
 
+var updateLock sync.Mutex
+
 func updateProcs() {
 	if len(procName) <= 0 {
 		return
 	}
+	updateLock.Lock()
+	defer updateLock.Unlock()
 
 	ports := Client.GetPorts("^alsa-jack\\.jackP\\.", Ports[0].GetType(), jack.PortIsOutput)
 	procs := make(map[string]int)
@@ -108,6 +112,8 @@ func updateSources() {
 	if len(source) <= 0 {
 		return
 	}
+	updateLock.Lock()
+	defer updateLock.Unlock()
 
 	ports := Client.GetPorts("^"+source, Ports[0].GetType(), jack.PortIsOutput)
 	sources := make(map[string][]string)
