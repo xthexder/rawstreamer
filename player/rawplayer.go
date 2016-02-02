@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"code.google.com/p/portaudio-go/portaudio"
+	"github.com/gordonklaus/portaudio"
 	"github.com/cheggaaa/pb"
 	"github.com/xthexder/rawstreamer"
 )
