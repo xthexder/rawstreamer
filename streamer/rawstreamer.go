@@ -24,10 +24,22 @@ var BufferPool chan []jack.AudioSample
 var Listener net.Listener
 var ClientWaitGroup sync.WaitGroup
 var ShuttingDown chan struct{}
+var NoSignalCount uint64
 
 func process(nframes uint32) int {
 	lsamples := Ports[0].GetBuffer(nframes)
 	rsamples := Ports[1].GetBuffer(nframes)
+	NoSignalCount++
+	for i, _ := range lsamples {
+		if lsamples[i] != 0 || rsamples[i] != 0 {
+			NoSignalCount = 0
+			break
+		}
+	}
+	if NoSignalCount > 10 {
+		return 0
+	}
+
 	for client, bufp := range Buffers {
 		buf := (*chan []jack.AudioSample)(atomic.LoadPointer(&bufp))
 		if buf == nil {

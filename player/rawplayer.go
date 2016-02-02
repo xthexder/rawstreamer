@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gordonklaus/portaudio"
 	"github.com/cheggaaa/pb"
+	"github.com/gordonklaus/portaudio"
 	"github.com/xthexder/rawstreamer"
 )
 
@@ -20,6 +20,7 @@ var Stream *portaudio.Stream
 var Buffers []chan float32
 var Buffering int32
 var BufferingSync sync.Mutex
+var LastLeft, LastRight float32
 
 func processAudio(out [][]float32) {
 	bar.Set(len(Buffers[0]))
@@ -28,24 +29,28 @@ func processAudio(out [][]float32) {
 			select {
 			case out[0][i] = <-Buffers[0]:
 				out[1][i] = <-Buffers[1]
+				LastLeft = out[0][i]
+				LastRight = out[1][i]
 			default:
-				fmt.Println("Buffer underflow!")
+				if LastLeft != 0 || LastRight != 0 {
+					fmt.Println("Buffer underflow!")
+				}
 				go func() {
 					BufferingSync.Lock()
 					defer BufferingSync.Unlock()
 					atomic.StoreInt32(&Buffering, int32(cap(Buffers[0])-len(Buffers[0])))
 				}()
 				for ; i < len(out[0]); i++ {
-					out[0][i] = 0
-					out[1][i] = 0
+					out[0][i] = LastLeft
+					out[1][i] = LastRight
 				}
 				return
 			}
 		}
 	} else {
 		for i := range out[0] {
-			out[0][i] = 0
-			out[1][i] = 0
+			out[0][i] = LastLeft
+			out[1][i] = LastRight
 		}
 	}
 }
@@ -149,6 +154,8 @@ func main() {
 	}
 
 	Buffering = int32(getChannelBufferSize(bufferLen, bufferSize, sampleRate))
+	LastLeft = 0
+	LastRight = 0
 
 	printStatus()
 
