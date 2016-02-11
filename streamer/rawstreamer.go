@@ -24,21 +24,10 @@ var BufferPool chan []jack.AudioSample
 var Listener net.Listener
 var ClientWaitGroup sync.WaitGroup
 var ShuttingDown chan struct{}
-var NoSignalCount uint64
 
 func process(nframes uint32) int {
 	lsamples := Ports[0].GetBuffer(nframes)
 	rsamples := Ports[1].GetBuffer(nframes)
-	NoSignalCount++
-	for i, _ := range lsamples {
-		if lsamples[i] != 0 || rsamples[i] != 0 {
-			NoSignalCount = 0
-			break
-		}
-	}
-	if NoSignalCount > 10 {
-		return 0
-	}
 
 	for client, bufp := range Buffers {
 		buf := (*chan []jack.AudioSample)(atomic.LoadPointer(&bufp))
@@ -266,6 +255,7 @@ func streamConnection(conn *net.TCPConn) {
 		}
 	}
 
+	var lastSignal time.Time
 	bytes = make([]byte, 0, int(Client.GetBufferSize())*2)
 	for {
 		buffer := <-buf
@@ -276,16 +266,36 @@ func streamConnection(conn *net.TCPConn) {
 		lsamples := buffer[:len(buffer)/2]
 		rsamples := buffer[len(buffer)/2:]
 
+		signal := false
 		for i := range lsamples {
 			rawstreamer.WriteFloat32(sample[:numBytes], float32(lsamples[i]), formatFlag, endianness)
 			rawstreamer.WriteFloat32(sample[numBytes:], float32(rsamples[i]), formatFlag, endianness)
 
+			signal = signal || lsamples[i] != 0 || rsamples[i] != 0
+
 			bytes = append(bytes, sample...)
+		}
+		if signal {
+			lastSignal = time.Now()
+		} else if time.Since(lastSignal) > 1*time.Second {
+			if time.Since(lastSignal) <= 1*time.Minute {
+				returnToPool(buffer)
+				bytes = bytes[:0]
+				continue
+			}
+			// Send some data for keepalive
+			lastSignal = time.Now()
 		}
 
 		err = writeAligned(conn, bytes, time.Now().Add(bufferLen))
 		if err == ErrWriteTimeout {
 			fmt.Println("Write timeout!")
+
+			// Skip forward the length of the timeout
+			for i := 0; i <= cap(buf)/2; i++ {
+				returnToPool(buffer)
+				buffer = <-buf
+			}
 		} else if err != nil {
 			fmt.Printf("Sample write error: %v\n", err)
 			returnToPool(buffer)
@@ -303,7 +313,7 @@ var bufSync sync.Mutex
 func getBufferChanSize() int {
 	bufferSize := time.Duration(atomic.LoadUint32(&jackBufferSize) / 2)
 	sampleRate := time.Duration(Client.GetSampleRate())
-	return int(bufferLen*sampleRate/bufferSize/time.Second) + 1
+	return int(bufferLen*sampleRate/bufferSize/time.Second)*2 + 1
 }
 
 func getBuffer() (int, chan []jack.AudioSample) {
@@ -327,7 +337,7 @@ var jackBufferSize uint32
 func initPool() {
 	atomic.StoreUint32(&jackBufferSize, Client.GetBufferSize()*2)
 	bufferSize := int(atomic.LoadUint32(&jackBufferSize))
-	BufferPool = make(chan []jack.AudioSample, getBufferChanSize()*maxConns)
+	BufferPool = make(chan []jack.AudioSample, maxConns)
 	for i := 0; i < cap(BufferPool); i++ {
 		BufferPool <- make([]jack.AudioSample, bufferSize)
 	}
