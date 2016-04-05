@@ -183,9 +183,11 @@ func main() {
 		}
 	}
 
+	var lastData time.Time
 	remainder := 0
 	for {
 		n := 0
+		conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 		n, err = io.ReadAtLeast(conn, buf[remainder:], numBytes*2-remainder)
 		if err != nil {
 			fmt.Println("Error reading stream:", err)
@@ -196,12 +198,20 @@ func main() {
 
 		for i := 0; i < (n - remainder); i += numBytes * 2 {
 			BufferingSync.Lock()
-			if atomic.LoadInt32(&Buffering) > 0 {
+
+			left := rawstreamer.ReadFloat32(buf[i:i+numBytes], flags, Endianness)
+			right := rawstreamer.ReadFloat32(buf[i+numBytes:i+numBytes*2], flags, Endianness)
+			if left != 0 || right != 0 {
+				lastData = time.Now()
+				Buffers[0] <- left
+				Buffers[1] <- right
+			} else if time.Since(lastData) < 1*time.Minute {
+				Buffers[0] <- left
+				Buffers[1] <- right
+			}
+			if atomic.LoadInt32(&Buffering) > 0 && time.Since(lastData) < 1*time.Minute {
 				atomic.AddInt32(&Buffering, -1)
 			}
-
-			Buffers[0] <- rawstreamer.ReadFloat32(buf[i:i+numBytes], flags, Endianness)
-			Buffers[1] <- rawstreamer.ReadFloat32(buf[i+numBytes:i+numBytes*2], flags, Endianness)
 			BufferingSync.Unlock()
 		}
 

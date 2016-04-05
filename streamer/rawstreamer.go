@@ -255,7 +255,7 @@ func streamConnection(conn *net.TCPConn) {
 		}
 	}
 
-	var lastSignal time.Time
+	var lastSignal, lastKeepalive time.Time
 	bytes = make([]byte, 0, int(Client.GetBufferSize())*2)
 	for {
 		buffer := <-buf
@@ -277,14 +277,16 @@ func streamConnection(conn *net.TCPConn) {
 		}
 		if signal {
 			lastSignal = time.Now()
-		} else if time.Since(lastSignal) > 1*time.Second {
-			if time.Since(lastSignal) <= 1*time.Minute {
+		} else if time.Since(lastSignal) > 1*time.Minute {
+			if time.Since(lastKeepalive) > 1*time.Minute {
+				lastKeepalive = time.Now()
+			} else {
 				returnToPool(buffer)
 				bytes = bytes[:0]
 				continue
 			}
-			// Send some data for keepalive
-			lastSignal = time.Now()
+		} else {
+			lastKeepalive = time.Now()
 		}
 
 		err = writeAligned(conn, bytes, time.Now().Add(bufferLen))
